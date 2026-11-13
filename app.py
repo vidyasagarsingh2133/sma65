@@ -25,15 +25,14 @@ def clean_symbol(value):
     value = str(value).strip().upper()
     value = re.sub(r"^(NSE:|NSE\s*:\s*)", "", value)
     value = value.removesuffix(".NS")
-    if not re.fullmatch(r"[A-Z0-9&_-]+", value):
+    if not re.fullmatch(r"[A-Z0-9&_.-]+", value):
         return None
     return value.replace(".", "-") + ".NS"
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_universe(name):
-    url = UNIVERSES[name]
-    response = requests.get(url, headers={"User-Agent": "TrendCraftScanner/1.0 (research app)"}, timeout=20)
+    response = requests.get(UNIVERSES[name], headers={"User-Agent": "TrendCraftScanner/1.0 (research app)"}, timeout=20)
     response.raise_for_status()
     tables = pd.read_html(io.StringIO(response.text))
     candidates = []
@@ -46,12 +45,6 @@ def fetch_universe(name):
     if not symbols:
         raise ValueError("Could not find a constituent symbol column on the source page.")
     return symbols
-
-
-def get_field(frame, field):
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-    return frame[field]
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -67,12 +60,12 @@ def load_history(symbol, period, interval):
     return frame[list(required)].sort_index().dropna(subset=["High", "Low", "Close"])
 
 
-def calculate_signals(frame, sma_length=65, pivot_bars=2, adx_length=14, adx_floor=18.0, slope_bars=5):
-    """Approximate confirmed-pivot BOS plus SMA-channel and anti-sideways filters."""
+def calculate_signals(frame, sma_length=65, pivot_bars=2, adx_length=14, adx_floor=18.0, slope_bars=5, signal_confirm_bars=1):
+    """Approximate confirmed-pivot BOS plus SMA-channel, trend and N-bar confirmation filters."""
     data = frame.copy()
     data["sma_low"] = data["Low"].rolling(sma_length, min_periods=sma_length).mean()
     data["sma_high"] = data["High"].rolling(sma_length, min_periods=sma_length).mean()
-    # Wilder-style directional movement and ADX, smoothed with an EMA.
+
     up = data["High"].diff()
     down = -data["Low"].diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
@@ -85,69 +78,79 @@ def calculate_signals(frame, sma_length=65, pivot_bars=2, adx_length=14, adx_flo
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     data["adx"] = dx.ewm(alpha=1 / adx_length, min_periods=adx_length, adjust=False).mean()
 
-    # A pivot is only made available after its right-side confirmation bars have closed.
+    # The pivot is not available until its right-hand confirmation bars have closed.
     pivot = data["High"].shift(pivot_bars)
     is_pivot = pd.Series(True, index=data.index)
     for offset in range(1, pivot_bars + 1):
         is_pivot &= (pivot > data["High"].shift(pivot_bars + offset)) & (pivot >= data["High"].shift(pivot_bars - offset))
     data["pivot_high"] = pivot.where(is_pivot).ffill()
-    data["bos"] = (data["Close"] > data["pivot_high"]) & (data["Close"].shift(1) <= data["pivot_high"].shift(1))
     data["above_channel"] = (data["Close"] > data["sma_high"]) & (data["Close"] > data["sma_low"])
     data["up_slope"] = data["sma_low"] > data["sma_low"].shift(slope_bars)
     data["trend_ok"] = data["above_channel"] & data["up_slope"] & (data["adx"] >= adx_floor)
-    data["signal"] = data["bos"] & data["trend_ok"]
+
+    above_pivot = data["Close"] > data["pivot_high"]
+    confirmed_break = above_pivot.rolling(signal_confirm_bars, min_periods=signal_confirm_bars).sum().eq(signal_confirm_bars)
+    confirmed_trend = data["trend_ok"].rolling(signal_confirm_bars, min_periods=signal_confirm_bars).sum().eq(signal_confirm_bars)
+    setup = confirmed_break & confirmed_trend
+    data["signal"] = setup & ~setup.shift(1, fill_value=False)
     data["red"] = (data["Close"] < data["sma_low"]) & (data["Close"] < data["sma_high"])
     return data
 
 
-def scan_symbol(symbol, frame, lookback, adx_floor):
+def scan_symbol(symbol, frame, entry_window, adx_floor, signal_confirm_bars):
     if len(frame) < 100:
         return None
-    data = calculate_signals(frame, adx_floor=adx_floor)
-    recent_signals = data.index[data["signal"]].tolist()
-    if not recent_signals:
+    data = calculate_signals(frame, adx_floor=adx_floor, signal_confirm_bars=signal_confirm_bars)
+    signal_positions = np.flatnonzero(data["signal"].fillna(False).to_numpy())
+    if not len(signal_positions):
         return None
     last = data.iloc[-1]
-    for signal_date in reversed(recent_signals):
-        if data.index.get_loc(data.index[-1]) - data.index.get_loc(signal_date) > lookback:
+    for position in signal_positions[::-1]:
+        age = len(data) - 1 - position
+        if age > entry_window:
             break
-        signal_bar = data.loc[signal_date]
-        # Entry condition: latest completed price has cleared the signal candle high.
-        if last["Close"] > signal_bar["High"] and bool(last["trend_ok"]) and not bool(last["red"]):
+        signal_bar = data.iloc[position]
+        if float(last["Close"]) > float(signal_bar["High"]) and bool(last["trend_ok"]) and not bool(last["red"]):
             return {
-                "Symbol": symbol.removesuffix(".NS"), "Signal date": pd.Timestamp(signal_date).date(),
+                "Symbol": symbol.removesuffix(".NS"), "Signal date": pd.Timestamp(data.index[position]).date(),
                 "Signal high": round(float(signal_bar["High"]), 2), "Latest close": round(float(last["Close"]), 2),
-                "ADX": round(float(last["adx"]), 1), "SMA low": round(float(last["sma_low"]), 2),
-                "SMA high": round(float(last["sma_high"]), 2), "Status": "BUY — above signal high",
+                "Candles since signal": age, "ADX": round(float(last["adx"]), 1),
+                "SMA low": round(float(last["sma_low"]), 2), "SMA high": round(float(last["sma_high"]), 2),
+                "Status": "BUY — above signal high",
             }
     return None
 
 
-def run_backtest(symbol, frame, capital_per_trade, adx_floor):
-    data = calculate_signals(frame, adx_floor=adx_floor)
+def run_backtest(symbol, frame, capital_per_trade, adx_floor, signal_confirm_bars, entry_window):
+    data = calculate_signals(frame, adx_floor=adx_floor, signal_confirm_bars=signal_confirm_bars)
     trades = []
     active = None
     for i in range(len(data)):
         row = data.iloc[i]
         stamp = data.index[i]
-        if active is not None and bool(row["red"]):
+        # Exit only when the channel is red AND the closing exit price exceeds entry.
+        if active is not None and active["entry"] is not None and bool(row["red"]) and float(row["Close"]) > active["entry"]:
             exit_price = float(row["Close"])
             units = capital_per_trade / active["entry"]
-            trades.append({"Symbol": symbol.removesuffix(".NS"), "Signal date": active["signal_date"], "Entry date": active["entry_date"], "Entry price": active["entry"], "Exit date": pd.Timestamp(stamp).date(), "Exit price": exit_price, "Candles held": i - active["entry_index"], "Investment (₹)": capital_per_trade, "P&L (₹)": (exit_price - active["entry"]) * units, "Return (%)": (exit_price / active["entry"] - 1) * 100, "Status": "CLOSED"})
+            trades.append({"Symbol": symbol.removesuffix(".NS"), "Signal date": active["signal_date"], "Entry date": active["entry_date"], "Entry price": active["entry"], "Exit date": pd.Timestamp(stamp).date(), "Exit price": exit_price, "Candles held": i - active["entry_index"], "Investment (₹)": capital_per_trade, "P&L (₹)": (exit_price - active["entry"]) * units, "Return (%)": (exit_price / active["entry"] - 1) * 100, "Status": "CLOSED — profitable exit"})
             active = None
+
+        # An unfilled setup expires after N candles; it cannot remain pending forever.
+        if active is not None and active["entry"] is None and i - active["signal_index"] > entry_window:
+            active = None
+
         if active is None and bool(row["signal"]):
-            # Fill only on a later candle after its high trades through the signal candle high.
-            signal_high = float(row["High"])
-            active = {"signal_date": pd.Timestamp(stamp).date(), "signal_high": signal_high, "entry": None, "entry_date": None, "entry_index": None}
-        elif active is not None and active["entry"] is None and i > 0:
-            if float(row["High"]) >= active["signal_high"]:
+            active = {"signal_date": pd.Timestamp(stamp).date(), "signal_index": i, "signal_high": float(row["High"]), "entry": None, "entry_date": None, "entry_index": None}
+        elif active is not None and active["entry"] is None and i > active["signal_index"]:
+            if float(row["High"]) > active["signal_high"]:
                 fill = max(float(row["Open"]), active["signal_high"])
                 active.update(entry=fill, entry_date=pd.Timestamp(stamp).date(), entry_index=i)
-        # Mark open positions at the last available close for transparent backtest reporting.
+
+        # Open positions remain open if a red-channel exit is at/below entry; mark to market only.
         if i == len(data) - 1 and active is not None and active["entry"] is not None:
             close = float(row["Close"])
             units = capital_per_trade / active["entry"]
-            trades.append({"Symbol": symbol.removesuffix(".NS"), "Signal date": active["signal_date"], "Entry date": active["entry_date"], "Entry price": active["entry"], "Exit date": pd.Timestamp(stamp).date(), "Exit price": close, "Candles held": i - active["entry_index"], "Investment (₹)": capital_per_trade, "P&L (₹)": (close - active["entry"]) * units, "Return (%)": (close / active["entry"] - 1) * 100, "Status": "OPEN — marked to market"})
+            trades.append({"Symbol": symbol.removesuffix(".NS"), "Signal date": active["signal_date"], "Entry date": active["entry_date"], "Entry price": active["entry"], "Exit date": pd.Timestamp(stamp).date(), "Exit price": close, "Candles held": i - active["entry_index"], "Investment (₹)": capital_per_trade, "P&L (₹)": (close - active["entry"]) * units, "Return (%)": (close / active["entry"] - 1) * 100, "Status": "OPEN — marked to market, no profitable exit yet"})
     return trades
 
 
@@ -157,13 +160,14 @@ with st.sidebar:
     timeframe = st.radio("⏱️ Timeframe", ["1 Day", "1 Week"], horizontal=True)
     sma_length = st.number_input("SMA channel length", min_value=10, max_value=200, value=65)
     adx_floor = st.slider("Minimum ADX (sideways-market filter)", 10, 40, 18)
-    lookback = st.slider("Signal valid for candles", 1, 20, 5)
-    st.caption("The SMA/channel and ADX/slope filters are applied to avoid weak or sideways trends.")
+    signal_confirm_bars = st.slider("N candles to confirm signal", 1, 10, 1, help="Require this many consecutive closes above the confirmed pivot while the trend filter is valid.")
+    entry_window = st.slider("N candles allowed for entry", 1, 30, 5, help="The entry must cross above the signal candle high within this many candles after the signal.")
+    st.caption("The SMA/channel and ADX/slope filters help avoid weak or sideways trends.")
     upload = st.file_uploader("Optional: upload a CSV to scan a custom list (column: Symbol)", type=["csv"])
 
-period = "10y" if timeframe == "1 Week" else "5y"
+scan_period = "10y" if timeframe == "1 Week" else "5y"
 interval = "1wk" if timeframe == "1 Week" else "1d"
-scan_tab, backtest_tab, method_tab = st.tabs(["🔎 Daily scan", "🧪 Backtest & Excel", "ℹ️ Strategy"])
+scan_tab, backtest_tab, method_tab = st.tabs(["🔎 Stock scan", "🧪 Backtest & Excel", "ℹ️ Strategy"])
 
 with scan_tab:
     if st.button("🔄 Scan now", type="primary"):
@@ -183,8 +187,8 @@ with scan_tab:
             progress = st.progress(0)
             for i, symbol in enumerate(symbols):
                 try:
-                    history = load_history(symbol, period, interval)
-                    candidate = scan_symbol(symbol, history, lookback, adx_floor) if not history.empty else None
+                    history = load_history(symbol, scan_period, interval)
+                    candidate = scan_symbol(symbol, history, entry_window, adx_floor, signal_confirm_bars) if not history.empty else None
                     if candidate:
                         results.append(candidate)
                 except Exception:
@@ -209,29 +213,32 @@ with scan_tab:
 
 with backtest_tab:
     st.subheader("Historical simulation")
-    st.write("Runs the same confirmed-pivot, rising-SMA, ADX and channel-exit rules over the selected index. Each trade uses the chosen fixed rupee amount; positions may overlap.")
+    st.write("Select how many years of data to backtest. The strategy enters after a later candle crosses the signal high and only closes a position at a red-channel candle whose close is above entry.")
+    backtest_years = st.selectbox("Backtest history", [1, 2, 3, 5, 10], index=2, format_func=lambda years: f"{years} year" if years == 1 else f"{years} years")
     capital_per_trade = st.number_input("Investment per trade (₹)", min_value=1000, max_value=10000000, value=100000, step=10000)
     if st.button("🧪 Run backtest", key="backtest"):
         try:
             symbols = fetch_universe(universe_name)
             trade_rows = []
             progress = st.progress(0)
+            period = f"{backtest_years}y"
             for i, symbol in enumerate(symbols):
                 try:
                     history = load_history(symbol, period, interval)
                     if not history.empty:
-                        trade_rows.extend(run_backtest(symbol, history, capital_per_trade, adx_floor))
+                        trade_rows.extend(run_backtest(symbol, history, capital_per_trade, adx_floor, signal_confirm_bars, entry_window))
                 except Exception:
                     pass
                 progress.progress((i + 1) / len(symbols))
-            trades = pd.DataFrame(trade_rows)
-            st.session_state["backtest_trades"] = trades
+            st.session_state["backtest_trades"] = pd.DataFrame(trade_rows)
+            st.session_state["backtest_years"] = backtest_years
         except Exception as exc:
             st.error(f"Backtest could not run: {exc}")
     if "backtest_trades" in st.session_state:
         trades = st.session_state["backtest_trades"]
+        st.caption(f"Period: {st.session_state.get('backtest_years', backtest_years)} years · {timeframe} candles · {universe_name}")
         if trades.empty:
-            st.warning("No completed or open trades were found for this period.")
+            st.warning("No trades were found for this period.")
         else:
             investment = float(trades["Investment (₹)"].sum())
             pnl = float(trades["P&L (₹)"].sum())
@@ -244,19 +251,18 @@ with backtest_tab:
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 trades.to_excel(writer, sheet_name="Trades", index=False)
-                pd.DataFrame([{"Trades": len(trades), "Total investment (₹)": investment, "Net P&L (₹)": pnl, "Return on deployed capital (%)": (pnl / investment * 100) if investment else 0}]).to_excel(writer, sheet_name="Summary", index=False)
+                pd.DataFrame([{"Backtest years": st.session_state.get("backtest_years", backtest_years), "Trades": len(trades), "Total investment (₹)": investment, "Net P&L (₹)": pnl, "Return on deployed capital (%)": (pnl / investment * 100) if investment else 0}]).to_excel(writer, sheet_name="Summary", index=False)
             st.download_button("⬇️ Download backtest (Excel)", output.getvalue(), "trendcraft_backtest.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with method_tab:
     st.subheader("Rules used by this app")
     st.markdown("""
-- **Timeframes:** daily or weekly candles; weekly is built from Yahoo Finance weekly data.
-- **Trend channel:** 65-period SMA of highs and lows. A bullish setup requires the close above both lines and the lower SMA rising.
-- **Structure:** a confirmed swing high (two bars on each side) is used as a simplified bullish Break of Structure (BoS). A signal candle closes above that pivot.
-- **Entry:** after the signal candle, price must trade above its high. The scanner shows a candidate only when the latest completed close is already above that level.
-- **Avoiding sideways action:** ADX must meet the selected threshold (default 18), and the lower SMA must be rising. ADX can lag and does not guarantee a trend.
-- **Exit:** exit at the close of the first candle below both SMA lines (the channel turns red). There is deliberately no stop-loss rule, as requested.
-- **Backtest assumptions:** one fixed rupee amount per trade, overlapping positions allowed, signal candle excluded from entry, gap-up entries filled at the open. Open trades are marked to market at the final close. Fees, taxes, slippage, dividends and liquidity constraints are not modeled.
+- **Timeframes:** daily or weekly candles.
+- **Signal:** confirmed swing-high breakout with an optional N consecutive-candle confirmation; trend filter requires price above the SMA channel, a rising lower SMA, and the selected ADX threshold.
+- **Entry:** after the signal, price must trade above the signal candle high within the selected N-candle entry window. The scanner lists a candidate only if the latest completed close is already above that high.
+- **Exit:** the channel must turn red (close below both SMA lines) AND the exit close must be strictly higher than entry. If price is red at a loss or breakeven, the backtest keeps the position open; there is no stop loss.
+- **Backtest period:** choose 1, 2, 3, 5, or 10 years; daily and weekly data are supported.
+- **Backtest assumptions:** one fixed rupee amount per trade; overlapping positions are allowed. Gap-up entries fill at the open. Positions without a profitable exit are reported as open and marked to market at the final close; this mark is not an exit.
 
-This is an approximate Python implementation of the supplied Pine Script idea, not a financial recommendation or a guarantee of results. Data and constituent pages are third-party services and can be delayed or unavailable. Validate signals and market data before making decisions.
+This is an approximate implementation of the supplied Pine Script idea, not financial advice or a guarantee of results. Data and constituent pages are third-party services. Fees, taxes, slippage, dividends and portfolio-level capital limits are not modeled. A strict profitable-exit-only rule can leave losing positions open indefinitely.
 """)
